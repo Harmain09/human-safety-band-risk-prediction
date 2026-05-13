@@ -1,0 +1,197 @@
+WOMEN SAFTEY BAND WITH RISK PRIDICTION
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Wire.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <TinyGPS++.h>
+#include <time.h>
+
+// ===== OLED =====
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ===== PINS =====
+#define TEMP_PIN 4
+#define BUTTON_PIN 14
+#define RXD2 16
+#define TXD2 17
+#define PULSE_PIN 33
+#define BAND_PIN 32
+#define BUZZER_PIN 27   // 🔊 Buzzer
+
+OneWire oneWire(TEMP_PIN);
+DallasTemperature sensors(&oneWire);
+TinyGPSPlus gps;
+HardwareSerial GPSSerial(1);
+
+// ===== WiFi & Telegram =====
+const char* ssid = "STARK";
+const char* password = "12341234";
+#define BOT_TOKEN "8300200368:AAEDH_1B3WmT9AJkxy6Vsdh3NxmbE7zF8OQ"
+#define CHAT_ID "7626748131"
+
+WiFiClientSecure secured_client;
+UniversalTelegramBot bot(BOT_TOKEN, secured_client);
+
+// ===== Time =====
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 19800;
+const int daylightOffset_sec = 0;
+
+// ===== Variables =====
+bool sosActive = false;
+bool tracking = false;
+bool bandRemoved = false;
+unsigned long lastSend = 0;
+const unsigned long interval = 30000;
+
+// ===== Heartbeat =====
+int bpm = 0;
+int bpmSmoothed = 0;
+int bpmHistory[10] = {0};
+int historyIndex = 0;
+unsigned long lastBeat = 0;
+int threshold = 2000;
+
+// ===== Band =====
+int bandThreshold = 1500;
+
+// ===== Time struct =====
+struct TimeInfo {
+  String day;
+  String time;
+  String date;
+};
+
+// ===== Buzzer =====
+void buzzerOn() { digitalWrite(BUZZER_PIN, HIGH); }
+void buzzerOff() { digitalWrite(BUZZER_PIN, LOW); }
+
+// ===== Time =====
+void setupTime() {
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+}
+
+TimeInfo getTimeNow() {
+  struct tm timeinfo;
+  TimeInfo t;
+  if (!getLocalTime(&timeinfo)) return {"Err","Err","Err"};
+  char d[10], tm[10], dt[15];
+  strftime(d,10,"%a",&timeinfo);
+  strftime(tm,10,"%H:%M:%S",&timeinfo);
+  strftime(dt,15,"%d-%m-%Y",&timeinfo);
+  return {d,tm,dt};
+}
+
+// ===== Telegram =====
+void sendMessage(String msg) {
+  bot.sendMessage(CHAT_ID, msg, "");
+}
+
+// ===== Heartbeat =====
+void readHeartbeat() {
+  int val = analogRead(PULSE_PIN);
+  unsigned long now = millis();
+  if (val > threshold) {
+    int diff = now - lastBeat;
+    if (diff > 300) {
+      bpm = constrain(60000 / diff, 55, 120);
+      lastBeat = now;
+      bpmHistory[historyIndex] = bpm;
+      historyIndex = (historyIndex + 1) % 10;
+    }
+  }
+  long sum = 0;
+  for (int i=0;i<10;i++) sum += bpmHistory[i];
+  bpmSmoothed = sum / 10;
+  if (bpmSmoothed == 0) bpmSmoothed = 75;
+}
+
+// ===== Band Removal =====
+void checkBandRemoval() {
+  int bandVal = analogRead(BAND_PIN);
+
+  if (bandVal < bandThreshold && !bandRemoved) {
+    bandRemoved = true;
+    buzzerOn();
+    TimeInfo t = getTimeNow();
+    sendMessage("⚠ BAND REMOVED\nTime: " + t.time + "\nDate: " + t.date);
+  }
+
+  if (bandVal >= bandThreshold && bandRemoved) {
+    bandRemoved = false;
+    buzzerOff();
+  }
+}
+
+// ===== Setup =====
+void setup() {
+  Serial.begin(115200);
+  GPSSerial.begin(9600, SERIAL_8N1, RXD2, TXD2);
+  sensors.begin();
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  buzzerOff();
+
+  Wire.begin(21,22);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.setTextColor(SSD1306_WHITE);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+
+  secured_client.setInsecure();
+  setupTime();
+  sendMessage("Senior Safety System Online");
+}
+
+// ===== Loop =====
+void loop() {
+  while (GPSSerial.available()) gps.encode(GPSSerial.read());
+
+  checkBandRemoval();
+  readHeartbeat();
+
+  sensors.requestTemperatures();
+  float tempC = sensors.getTempCByIndex(0);
+
+  // 🔥 High Temp Alert
+  if (tempC > 38.0) buzzerOn();
+
+  // 🆘 SOS
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    delay(2000);
+    if (!sosActive) {
+      sosActive = true;
+      buzzerOn();
+      TimeInfo t = getTimeNow();
+      sendMessage("🆘 SOS ALERT\nTime: " + t.time + "\nDate: " + t.date);
+    }
+  } else if (!bandRemoved && tempC <= 38.0) {
+    sosActive = false;
+    buzzerOff();
+  }
+
+  // ===== OLED =====
+  TimeInfo t = getTimeNow();
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("Senior Safety");
+  display.println("Time: " + t.time);
+  display.print("Temp: "); display.print(tempC); display.println(" C");
+  display.print("BPM: "); display.println(bpmSmoothed);
+
+  if (bandRemoved) display.println("Status: BAND OFF");
+  else if (sosActive) display.println("Status: SOS");
+  else display.println("Status: NORMAL");
+
+  display.display();
+  delay(1000);
+}
